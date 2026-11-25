@@ -1,0 +1,114 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h" // Bibliotheque pour l'algorithme SpO2
+
+// --- CONFIGURATION WI-FI ET N8N ---
+const char* ssid = "Livebox-99E0"; 
+const char* password = "LmYofQUvM3bbtuN6uD";
+const char* webhook_url = "http://192.168.1.11:5678/webhook-test/6dba8a5c-099f-4fc9-8b62-0ce3cf9921db";
+
+MAX30105 particleSensor;
+
+// Tableaux pour stocker les donnees et analyser le SpO2
+uint32_t irBuffer[100];  // Donnees de la LED Infrarouge
+uint32_t redBuffer[100]; // Donnees de la LED Rouge
+int32_t bufferLength = 100; // Longueur du buffer
+
+int32_t spo2;           // Valeur du SpO2
+int8_t validSPO2;       // Indicateur de validite du calcul SpO2
+int32_t heartRate;      // Valeur de la frequence cardiaque
+int8_t validHeartRate;  // Indicateur de validite du calcul de la frequence cardiaque
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); 
+
+  // 1. Connexion au reseau Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connexion au Wi-Fi en cours");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnexion Wi-Fi reussie !");
+
+  // 2. Initialisation du capteur
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("Capteur MAX30102 introuvable. Verifiez le cablage !");
+    while (1); // Arret du programme si le capteur n'est pas detecte
+  }
+
+  // Configuration du capteur pour lire les 2 LEDs (Mode SpO2)
+  byte ledBrightness = 60; // Luminosite des LEDs (0-255)
+  byte sampleAverage = 4;  // Moyenne de 4 echantillons
+  byte ledMode = 2;        // 2 = Activation LED Rouge + Infrarouge (Requis pour SpO2)
+  byte sampleRate = 100;   // 100 echantillons par seconde
+  int pulseWidth = 411;    
+  int adcRange = 4096;     
+  
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+
+  Serial.println("Debut de la collecte des donnees (environ 4 secondes)...");
+  
+  // Collecte des 100 premiers echantillons pour initialiser l'algorithme
+  for (byte i = 0 ; i < bufferLength ; i++) {
+    while (particleSensor.available() == false) particleSensor.check(); 
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample(); 
+  }
+}
+
+void loop() {
+  // Suppression des 25 echantillons les plus anciens, decalage des 75 nouveaux
+  for (byte i = 25; i < 100; i++) {
+    redBuffer[i - 25] = redBuffer[i];
+    irBuffer[i - 25] = irBuffer[i];
+  }
+
+  // Lecture de 25 nouveaux echantillons pour remplir la fin du tableau
+  for (byte i = 75; i < 100; i++) {
+    while (particleSensor.available() == false) particleSensor.check(); 
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample(); 
+  }
+
+  // Execution de l'algorithme pour calculer la frequence cardiaque et le SpO2
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+  // Si un doigt est detecte (Infrarouge > 50000) ET les donnees sont valides
+  if (irBuffer[50] > 50000) {
+    if (validHeartRate == 1 && validSPO2 == 1 && spo2 > 50 && spo2 <= 100) {
+      Serial.print("Frequence cardiaque : "); Serial.print(heartRate); Serial.print(" BPM | ");
+      Serial.print("SpO2 : "); Serial.print(spo2); Serial.println("% - Envoi en cours...");
+
+      // Creation du payload JSON avec les deux parametres
+      String jsonPayload = "{\"heart_rate\":" + String(heartRate) + ", \"spo2\":" + String(spo2) + "}";
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.begin(webhook_url);
+        http.addHeader("Content-Type", "application/json");
+        
+        int httpResponseCode = http.POST(jsonPayload);
+        if (httpResponseCode > 0) {
+          Serial.println("-> Envoi vers n8n reussi !");
+        } else {
+          Serial.print("-> Erreur d'envoi HTTP : "); Serial.println(httpResponseCode);
+        }
+        http.end();
+        
+        delay(5000); // Pause de 5 secondes apres l'envoi
+        particleSensor.clearFIFO(); // Nettoyage du buffer pour eviter le debordement
+      }
+    } else {
+      Serial.println("Traitement du signal en cours, veuillez garder le doigt immobile...");
+    }
+  } else {
+    Serial.println("Aucun doigt detecte sur le capteur...");
+    delay(500);
+  }
+}
